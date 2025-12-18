@@ -1,0 +1,30 @@
+name: Rotten Tomatoes Screenshots (3h)
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # every 3 hours UTC
+  workflow_dispatch: {}
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run screenshot script
+        run: python screenshot_rt.py
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: rt-screenshots-${{ github.run_id }}
+          path: screenshots/
