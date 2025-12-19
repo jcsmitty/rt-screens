@@ -1,16 +1,24 @@
 import os
 import re
+import json
+import csv
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 URLS_FILE = "urls.txt"
-OUT_DIR = "screenshots"
+
+OUT_SCREEN_DIR = "screenshots"   # optional screenshots
+OUT_DATA_DIR = "data"            # per-movie JSON dumps
+OUT_CSV_DIR = "csv"              # aggregated CSV per run
 
 NY_TZ = ZoneInfo("America/New_York")
-
 VIEWPORT = {"width": 1440, "height": 900}
+
+# Toggle these
+TAKE_SCREENSHOTS = False
+SCROLL_PIXELS = VIEWPORT["height"] // 3  # “half a screen less” than before
 
 def slugify(url: str) -> str:
     slug = url.rstrip("/").split("/")[-1]
@@ -30,7 +38,6 @@ def read_urls(path: str):
     return urls
 
 def try_click_by_text(page, texts, timeout_ms=1500) -> bool:
-    """Try clicking buttons/links by accessible name."""
     for t in texts:
         try:
             page.get_by_role("button", name=t).click(timeout=timeout_ms)
@@ -45,16 +52,12 @@ def try_click_by_text(page, texts, timeout_ms=1500) -> bool:
     return False
 
 def close_popups(page):
-    # Consent / modal buttons
     try_click_by_text(page, ["Accept", "Accept All", "I Agree", "Agree", "OK", "Got it", "Close"])
-
-    # Escape often closes overlays
     try:
         page.keyboard.press("Escape")
     except Exception:
         pass
 
-    # Generic close controls
     selectors = [
         "button[aria-label='Close']",
         "button[aria-label='close']",
@@ -75,107 +78,133 @@ def close_popups(page):
         except Exception:
             pass
 
-def scroll_half_screen(page):
-    """Scroll down ~½ viewport height."""
-    delta = VIEWPORT["height"] // 2
+def scroll_by(page, pixels: int):
     try:
-        page.mouse.wheel(0, delta)
+        page.mouse.wheel(0, pixels)
     except Exception:
-        page.evaluate("(h) => window.scrollBy(0, h)", delta)
+        page.evaluate("(h) => window.scrollBy(0, h)", pixels)
 
-def click_tomatometer_icon(page) -> bool:
+def get_media_scorecard_json(page) -> dict:
     """
-    Click the Tomatometer icon/area to open the fresh vs rotten breakdown.
+    Extract the JSON from:
+      <script id="media-scorecard-json" type="application/json"> ... </script>
 
-    Rotten Tomatoes markup varies a lot, so we try several strategies:
-    - role-based click by accessible name
-    - common data-qa/testid hooks
-    - click inside score-board component
-    - click near 'Tomatometer' label
+    Returns parsed dict.
     """
-    # 1) Accessible name attempts (best when present)
-    # These are intentionally broad.
-    if try_click_by_text(page, ["Tomatometer", "Tomatometer®"], timeout_ms=2000):
-        return True
+    loc = page.locator("script#media-scorecard-json").first
+    if loc.count() == 0:
+        raise RuntimeError("media-scorecard-json script tag not found")
 
-    # 2) Common hooks / selectors (best-effort)
-    selector_candidates = [
-        # Sometimes the icon or trigger has a qa/test id
-        "[data-qa*='tomatometer']",
-        "[data-testid*='tomatometer']",
-        "a[href*='tomatometer']",
-        "button:has-text('Tomatometer')",
-        "a:has-text('Tomatometer')",
+    raw = loc.inner_text(timeout=10_000).strip()
+    if not raw:
+        raise RuntimeError("media-scorecard-json script tag is empty")
+    return json.loads(raw)
 
-        # RT often uses <score-board> web component near the top
-        "score-board",
-    ]
+def pick(d: dict, keys):
+    return {k: d.get(k) for k in keys}
 
-    for sel in selector_candidates:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                # If we matched score-board itself, try clicking within it
-                if sel == "score-board":
-                    # Click the tomatometer "block" inside the scoreboard:
-                    # Try to click on the percentage / tomato icon area by targeting common sub-elements.
-                    inner_candidates = [
-                        "button",
-                        "a",
-                        "[data-qa*='tomatometer']",
-                        "text=Tomatometer",
-                        "text=%",  # often the score contains a percent
-                    ]
-                    for inner in inner_candidates:
-                        try:
-                            inner_loc = loc.locator(inner).first
-                            if inner_loc.count() > 0:
-                                inner_loc.click(timeout=2000)
-                                return True
-                        except Exception:
-                            pass
-                else:
-                    loc.click(timeout=2000)
-                    return True
-        except Exception:
-            pass
-
-    # 3) Click near the Tomatometer label: find the label, click its nearest clickable ancestor
-    try:
-        label = page.locator("text=Tomatometer").first
-        if label.count() > 0:
-            # Walk up to a reasonable ancestor and click it
-            container = label.locator("xpath=ancestor::*[self::button or self::a or self::div][1]")
-            if container.count() > 0:
-                container.first.click(timeout=2000)
-                return True
-    except Exception:
-        pass
-
-    return False
-
-def wait_for_breakdown_to_appear(page):
+def normalize_scorecard(url: str, slug: str, stamp: str, data: dict) -> dict:
     """
-    After clicking, wait briefly for a breakdown UI to appear.
-    We keep this light because we still want the run to succeed even if it never appears.
+    Pull out the exact fields you care about in a stable structure.
+    Your pasted blob includes:
+      criticsScore: likedCount, notLikedCount, reviewCount, scorePercent, averageRating, ...
+      audienceScore: ... same
+      overlay: criticsAll, criticsTop, audienceAll, audienceVerified ...
     """
-    # Try a few telltale words that often show up in the breakdown popover/modal.
-    # If none appear, we just move on and screenshot anyway.
-    try:
-        page.wait_for_timeout(700)
-        for pattern in ["Fresh", "Rotten", "fresh", "rotten"]:
-            loc = page.locator(f"text={pattern}")
-            if loc.count() > 0:
-                return
-        # If page is busy, give it a little more time
-        page.wait_for_timeout(800)
-    except Exception:
-        pass
+    out = {
+        "url": url,
+        "slug": slug,
+        "timestamp_et": stamp,
+    }
+
+    critics = data.get("criticsScore") or {}
+    audience = data.get("audienceScore") or {}
+    overlay = data.get("overlay") or {}
+
+    out["criticsScore"] = pick(critics, [
+        "score", "scorePercent", "averageRating", "reviewCount", "ratingCount",
+        "likedCount", "notLikedCount", "sentiment", "certified", "reviewsPageUrl", "title"
+    ])
+
+    out["audienceScore"] = pick(audience, [
+        "score", "scorePercent", "averageRating", "reviewCount",
+        "likedCount", "notLikedCount", "sentiment", "certified", "scoreType",
+        "bandedRatingCount", "reviewsPageUrl", "title"
+    ])
+
+    # Breakdown buckets (when present)
+    out["overlay"] = {}
+    for key in ["criticsAll", "criticsTop", "audienceAll", "audienceVerified"]:
+        if key in overlay and isinstance(overlay[key], dict):
+            out["overlay"][key] = pick(overlay[key], [
+                "score", "scorePercent", "averageRating", "reviewCount", "ratingCount",
+                "likedCount", "notLikedCount", "scoreType", "bandedRatingCount",
+                "sentiment", "certified", "scoreLinkText", "scoreLinkUrl", "reviewsPageUrl", "title"
+            ])
+
+    # Useful metadata if you want it
+    out["mediaType"] = overlay.get("mediaType") or data.get("mediaType")
+    out["primaryImageUrl"] = data.get("primaryImageUrl")
+    out["description"] = data.get("description")
+
+    return out
+
+def flatten_for_csv(record: dict) -> dict:
+    """
+    Produce one CSV row with the most important numbers.
+    """
+    def g(path, default=None):
+        cur = record
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur is not None else default
+
+    row = {
+        "timestamp_et": record["timestamp_et"],
+        "slug": record["slug"],
+        "url": record["url"],
+
+        "critics_score_percent": g(["criticsScore", "scorePercent"]),
+        "critics_review_count": g(["criticsScore", "reviewCount"]),
+        "critics_liked": g(["criticsScore", "likedCount"]),
+        "critics_not_liked": g(["criticsScore", "notLikedCount"]),
+        "critics_avg_rating": g(["criticsScore", "averageRating"]),
+
+        "audience_score_percent": g(["audienceScore", "scorePercent"]),
+        "audience_review_count": g(["audienceScore", "reviewCount"]),
+        "audience_liked": g(["audienceScore", "likedCount"]),
+        "audience_not_liked": g(["audienceScore", "notLikedCount"]),
+        "audience_avg_rating": g(["audienceScore", "averageRating"]),
+        "audience_score_type": g(["audienceScore", "scoreType"]),
+    }
+
+    # Optional breakdown columns
+    for key, prefix in [
+        ("criticsAll", "critics_all"),
+        ("criticsTop", "critics_top"),
+        ("audienceAll", "audience_all"),
+        ("audienceVerified", "audience_verified"),
+    ]:
+        row[f"{prefix}_score_percent"] = g(["overlay", key, "scorePercent"])
+        row[f"{prefix}_review_count"] = g(["overlay", key, "reviewCount"])
+        row[f"{prefix}_liked"] = g(["overlay", key, "likedCount"])
+        row[f"{prefix}_not_liked"] = g(["overlay", key, "notLikedCount"])
+        row[f"{prefix}_avg_rating"] = g(["overlay", key, "averageRating"])
+
+    return row
 
 def main():
     urls = read_urls(URLS_FILE)
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(OUT_DATA_DIR, exist_ok=True)
+    os.makedirs(OUT_CSV_DIR, exist_ok=True)
+    if TAKE_SCREENSHOTS:
+        os.makedirs(OUT_SCREEN_DIR, exist_ok=True)
+
     stamp = datetime.now(NY_TZ).strftime("%Y-%m-%d_%H-%M-%S_ET")
+
+    rows = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -189,55 +218,59 @@ def main():
         page = context.new_page()
 
         for url in urls:
-            movie_slug = slugify(url)
-            out_path = os.path.join(OUT_DIR, f"{stamp}__{movie_slug}.png")
+            slug = slugify(url)
+            json_out_path = os.path.join(OUT_DATA_DIR, f"{stamp}__{slug}.json")
+            png_out_path = os.path.join(OUT_SCREEN_DIR, f"{stamp}__{slug}.png")
 
             try:
                 print(f"Loading: {url}")
                 page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-                # Let RT finish hydrating
+                # Let RT hydrate; networkidle is best-effort (can hang)
                 try:
                     page.wait_for_load_state("networkidle", timeout=45_000)
                 except PlaywrightTimeoutError:
-                    # not fatal
                     pass
 
-                page.wait_for_timeout(1500)
+                # Popups can block content; best-effort close
+                page.wait_for_timeout(1200)
                 close_popups(page)
-                page.wait_for_timeout(800)
-                close_popups(page)
-
-                # Scroll down ~half a screen
-                scroll_half_screen(page)
-                page.wait_for_timeout(900)
-
-                # Click Tomatometer icon/area to open breakdown
-                clicked = click_tomatometer_icon(page)
-                print(f"Tomatometer click: {'OK' if clicked else 'FAILED'}")
-
-                # Some sites throw another modal after interaction
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(700)
                 close_popups(page)
 
-                # Wait briefly for breakdown to appear
-                wait_for_breakdown_to_appear(page)
+                # Optional: scroll a bit if your popup/headers cover the scorecard
+                scroll_by(page, SCROLL_PIXELS)
+                page.wait_for_timeout(700)
 
-                # Fallback-only screenshot (full viewport) AFTER click
-                page.screenshot(path=out_path, timeout=20_000)
-                print(f"Saved: {out_path}")
+                # ✅ Extract the embedded JSON (this is the main win)
+                raw = get_media_scorecard_json(page)
+                record = normalize_scorecard(url=url, slug=slug, stamp=stamp, data=raw)
+
+                with open(json_out_path, "w", encoding="utf-8") as f:
+                    json.dump(record, f, ensure_ascii=False, indent=2)
+                print(f"Saved data: {json_out_path}")
+
+                rows.append(flatten_for_csv(record))
+
+                # Optional: still grab your fallback screenshot for visual audit
+                if TAKE_SCREENSHOTS:
+                    page.screenshot(path=png_out_path, timeout=20_000)
+                    print(f"Saved screenshot: {png_out_path}")
 
             except Exception as e:
                 print(f"ERROR on {url}: {e}")
-                # Still try to capture *something*
-                try:
-                    page.screenshot(path=out_path, timeout=20_000)
-                    print(f"Saved (error fallback): {out_path}")
-                except Exception as e2:
-                    print(f"ERROR saving screenshot for {url}: {e2}")
 
         context.close()
         browser.close()
+
+    # Write a per-run CSV
+    if rows:
+        csv_path = os.path.join(OUT_CSV_DIR, f"{stamp}__rt_scores.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"Saved CSV: {csv_path}")
 
 if __name__ == "__main__":
     main()
